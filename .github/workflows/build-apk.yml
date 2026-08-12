@@ -23,7 +23,6 @@ jobs:
           PKG=$(find _unpacked -maxdepth 3 -name package.json -not -path "*/node_modules/*" -print -quit)
           if [ -z "$PKG" ]; then
             echo "::error::No package.json found inside $ZIP"
-            find _unpacked -maxdepth 3 | head -50
             exit 1
           fi
           ROOT=$(dirname "$PKG")
@@ -36,7 +35,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -55,21 +54,58 @@ jobs:
         working-directory: app_src
         run: npx expo prebuild --platform android --no-install
 
+      - name: Tune the Gradle build
+        working-directory: app_src/android
+        run: |
+          set -euo pipefail
+          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' gradle.properties
+          sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g/' gradle.properties
+          echo "org.gradle.parallel=false" >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
+          grep -E "reactNativeArchitectures|jvmargs" gradle.properties
+
+      # No --stacktrace: it buries the real message under 1000 lines of
+      # Gradle internals. The log is captured so the next step can extract it.
       - name: Build the APK
+        id: build
+        continue-on-error: true
         working-directory: app_src/android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          set -o pipefail
+          ./gradlew assembleRelease --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show the real error
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "=================== WHAT WENT WRONG ==================="
+          awk '/\* What went wrong:/,/\* Try:/' build.log | head -80 || true
+          echo ""
+          echo "=================== FAILING TASKS ====================="
+          grep -nE "^> Task .*FAILED|^FAILURE:|^e: |error:|Caused by:|Execution failed" build.log \
+            | grep -v "org.gradle.internal" | head -40 || true
+          echo ""
+          echo "=================== LAST 50 LINES ====================="
+          grep -v "^	at org.gradle" build.log | tail -50 || true
+          exit 1
+
+      - name: Upload the full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Collect the APK
         id: collect
+        if: always()
         run: |
-          set -euo pipefail
-          APK=$(find app_src/android -name "*.apk" -path "*release*" -print -quit)
+          APK=$(find app_src/android -name "*.apk" -path "*release*" -print -quit || true)
           if [ -z "$APK" ]; then
-            echo "::error::Gradle finished but produced no APK"
-            find app_src/android -name "*.apk" | head
-            exit 1
+            echo "No APK produced."
+            exit 0
           fi
           cp "$APK" BunkBank.apk
           ls -lh BunkBank.apk
