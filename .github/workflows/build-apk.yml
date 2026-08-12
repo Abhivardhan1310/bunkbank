@@ -1,0 +1,84 @@
+name: Build APK
+
+# Unzips the project, builds a release APK, and publishes it to Releases so it
+# can be installed straight from a phone browser. No Expo account, no keystore
+# setup, no terminal.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Unpack the project zip
+        run: |
+          set -e
+          ZIP=$(ls *.zip | head -1)
+          echo "Unpacking $ZIP"
+          unzip -q "$ZIP" -d _unpacked
+          # The zip contains a single top-level folder; move its contents up.
+          ROOT=$(find _unpacked -maxdepth 2 -name package.json -print -quit | xargs dirname)
+          echo "Project root: $ROOT"
+          mkdir -p app_src
+          cp -r "$ROOT"/. app_src/
+          ls app_src
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        working-directory: app_src
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: app_src
+        run: npx tsc --noEmit
+
+      - name: Generate the native Android project
+        working-directory: app_src
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build the APK
+        working-directory: app_src/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Name the file
+        id: name
+        run: |
+          echo "stamp=$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+          cp app_src/android/app/build/outputs/apk/release/app-release.apk \
+             BunkBank.apk
+          ls -lh BunkBank.apk
+
+      - name: Publish it to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.name.outputs.stamp }}
+          name: BunkBank ${{ steps.name.outputs.stamp }}
+          body: |
+            Tap **BunkBank.apk** below to install on your phone.
+
+            Android will warn about installing from an unknown source — allow it
+            for your browser, then open the file.
+          files: BunkBank.apk
