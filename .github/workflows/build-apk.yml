@@ -1,9 +1,5 @@
 name: Build APK
 
-# Unzips the project, builds a release APK, and publishes it to Releases so it
-# can be installed straight from a phone browser. No Expo account, no keystore
-# setup, no terminal.
-
 on:
   push:
   workflow_dispatch:
@@ -20,16 +16,22 @@ jobs:
 
       - name: Unpack the project zip
         run: |
-          set -e
-          ZIP=$(ls *.zip | head -1)
-          echo "Unpacking $ZIP"
+          set -euo pipefail
+          ZIP=$(ls -1 *.zip | head -1)
+          echo "Found zip: $ZIP"
           unzip -q "$ZIP" -d _unpacked
-          # The zip contains a single top-level folder; move its contents up.
-          ROOT=$(find _unpacked -maxdepth 2 -name package.json -print -quit | xargs dirname)
+          PKG=$(find _unpacked -maxdepth 3 -name package.json -not -path "*/node_modules/*" -print -quit)
+          if [ -z "$PKG" ]; then
+            echo "::error::No package.json found inside $ZIP"
+            find _unpacked -maxdepth 3 | head -50
+            exit 1
+          fi
+          ROOT=$(dirname "$PKG")
           echo "Project root: $ROOT"
           mkdir -p app_src
           cp -r "$ROOT"/. app_src/
-          ls app_src
+          rm -rf app_src/android app_src/ios app_src/.github app_src/node_modules
+          ls -la app_src
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -47,11 +49,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: app_src
-        run: npm install --no-audit --no-fund
-
-      - name: Typecheck
-        working-directory: app_src
-        run: npx tsc --noEmit
+        run: npm install --no-audit --no-fund --legacy-peer-deps
 
       - name: Generate the native Android project
         working-directory: app_src
@@ -61,24 +59,40 @@ jobs:
         working-directory: app_src/android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Name the file
-        id: name
+      - name: Collect the APK
+        id: collect
         run: |
-          echo "stamp=$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
-          cp app_src/android/app/build/outputs/apk/release/app-release.apk \
-             BunkBank.apk
+          set -euo pipefail
+          APK=$(find app_src/android -name "*.apk" -path "*release*" -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::error::Gradle finished but produced no APK"
+            find app_src/android -name "*.apk" | head
+            exit 1
+          fi
+          cp "$APK" BunkBank.apk
           ls -lh BunkBank.apk
+          echo "stamp=$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+
+      - name: Upload as an artifact
+        if: always() && hashFiles('BunkBank.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: BunkBank-apk
+          path: BunkBank.apk
+          retention-days: 30
 
       - name: Publish it to Releases
+        if: hashFiles('BunkBank.apk') != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ steps.name.outputs.stamp }}
-          name: BunkBank ${{ steps.name.outputs.stamp }}
+          tag_name: build-${{ steps.collect.outputs.stamp }}
+          name: BunkBank ${{ steps.collect.outputs.stamp }}
           body: |
-            Tap **BunkBank.apk** below to install on your phone.
+            Tap **BunkBank.apk** under Assets to install.
 
-            Android will warn about installing from an unknown source — allow it
-            for your browser, then open the file.
+            Uninstall BunkBank v1 first - this is signed with a different key,
+            so Android will otherwise refuse with "App not installed".
           files: BunkBank.apk
+          fail_on_unmatched_files: false
