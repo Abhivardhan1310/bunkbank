@@ -21,21 +21,19 @@ jobs:
           echo "Found zip: $ZIP"
           unzip -q "$ZIP" -d _unpacked
           PKG=$(find _unpacked -maxdepth 3 -name package.json -not -path "*/node_modules/*" -print -quit)
-          if [ -z "$PKG" ]; then
-            echo "::error::No package.json found inside $ZIP"
-            exit 1
-          fi
+          [ -n "$PKG" ] || { echo "::error::No package.json inside $ZIP"; exit 1; }
           ROOT=$(dirname "$PKG")
           echo "Project root: $ROOT"
           mkdir -p app_src
           cp -r "$ROOT"/. app_src/
           rm -rf app_src/android app_src/ios app_src/.github app_src/node_modules
-          ls -la app_src
 
+      # Node 20 matches react-native 0.86's engines field. Node 22 moved the
+      # failure earlier, so it is not the version to be on.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -54,18 +52,29 @@ jobs:
         working-directory: app_src
         run: npx expo prebuild --platform android --no-install
 
+      # Pre-flight: run the node commands Gradle shells out to, so an obvious
+      # breakage surfaces with a readable error instead of "exit value 1".
+      - name: Check the node helpers Gradle depends on
+        working-directory: app_src
+        run: |
+          echo "node: $(node --version)"
+          echo "--- expo config ---"
+          npx expo config --json --type public > /dev/null && echo OK
+          echo "--- autolinking resolve ---"
+          npx expo-modules-autolinking resolve -p android --json > /dev/null && echo OK
+          echo "--- react-native config ---"
+          npx expo-modules-autolinking react-native-config --json --platform android > /dev/null && echo OK
+
       - name: Tune the Gradle build
         working-directory: app_src/android
         run: |
           set -euo pipefail
           sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' gradle.properties
           sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g/' gradle.properties
-          echo "org.gradle.parallel=false" >> gradle.properties
-          echo "org.gradle.daemon=false" >> gradle.properties
           grep -E "reactNativeArchitectures|jvmargs" gradle.properties
 
-      # No --stacktrace: it buries the real message under 1000 lines of
-      # Gradle internals. The log is captured so the next step can extract it.
+      # --info makes Gradle print the full command line of every process it
+      # spawns, which is the only way to see which `node` call is failing.
       - name: Build the APK
         id: build
         continue-on-error: true
@@ -73,28 +82,37 @@ jobs:
         run: |
           chmod +x ./gradlew
           set -o pipefail
-          ./gradlew assembleRelease --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          ./gradlew assembleRelease --no-daemon --console=plain --info 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Show the real error
         if: steps.build.outcome == 'failure'
         run: |
-          echo "=================== WHAT WENT WRONG ==================="
-          awk '/\* What went wrong:/,/\* Try:/' build.log | head -80 || true
+          echo "============= NODE COMMANDS GRADLE RAN ============="
+          grep -n "Command: node" build.log | tail -8 || echo "(none found)"
           echo ""
-          echo "=================== FAILING TASKS ====================="
-          grep -nE "^> Task .*FAILED|^FAILURE:|^e: |error:|Caused by:|Execution failed" build.log \
-            | grep -v "org.gradle.internal" | head -40 || true
+          echo "============= CONTEXT AT THE FAILURE =============="
+          LAST=$(grep -n "Command: node" build.log | tail -1 | cut -d: -f1 || true)
+          if [ -n "$LAST" ]; then
+            START=$([ "$LAST" -gt 10 ] && echo $((LAST - 10)) || echo 1)
+            sed -n "${START},$((LAST + 80))p" build.log
+          fi
           echo ""
-          echo "=================== LAST 50 LINES ====================="
-          grep -v "^	at org.gradle" build.log | tail -50 || true
+          echo "============= WHAT WENT WRONG ====================="
+          awk '/\* What went wrong:/,/\* Try:/' build.log || true
+          echo ""
+          echo "============= LAST 40 USEFUL LINES ================"
+          grep -v "^	at org.gradle" build.log | tail -40 || true
           exit 1
 
       - name: Upload the full build log
         if: always()
-        uses: actions/upload-artifact@v4
+        run: gzip -9 build.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: build-log
-          path: build.log
+          path: build.log.gz
           retention-days: 14
           if-no-files-found: ignore
 
@@ -103,10 +121,7 @@ jobs:
         if: always()
         run: |
           APK=$(find app_src/android -name "*.apk" -path "*release*" -print -quit || true)
-          if [ -z "$APK" ]; then
-            echo "No APK produced."
-            exit 0
-          fi
+          [ -n "$APK" ] || { echo "No APK produced."; exit 0; }
           cp "$APK" BunkBank.apk
           ls -lh BunkBank.apk
           echo "stamp=$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
@@ -128,7 +143,7 @@ jobs:
           body: |
             Tap **BunkBank.apk** under Assets to install.
 
-            Uninstall BunkBank v1 first - this is signed with a different key,
-            so Android will otherwise refuse with "App not installed".
+            Uninstall BunkBank v1 first - different signing key.
           files: BunkBank.apk
           fail_on_unmatched_files: false
+
