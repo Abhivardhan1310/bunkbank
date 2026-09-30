@@ -28,8 +28,6 @@ jobs:
           cp -r "$ROOT"/. app_src/
           rm -rf app_src/android app_src/ios app_src/.github app_src/node_modules
 
-      # Node 20 matches react-native 0.86's engines field. Node 22 moved the
-      # failure earlier, so it is not the version to be on.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -41,8 +39,22 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # The runner image already ships the Android SDK. The setup-android action
+      # tries to re-provision it and fails; using what is already installed is
+      # both faster and what worked before.
+      - name: Use the runner's Android SDK
+        run: |
+          set -euo pipefail
+          SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}
+          echo "Using SDK at $SDK"
+          ls "$SDK" || { echo "::error::No Android SDK on this runner"; exit 1; }
+          echo "ANDROID_HOME=$SDK"     >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          mkdir -p "$SDK/licenses"
+          # Gradle downloads the platform and NDK it needs; these are the
+          # standard published license hashes that let it do so unattended.
+          printf '8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n' > "$SDK/licenses/android-sdk-license"
+          printf '84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n' > "$SDK/licenses/android-sdk-preview-license"
 
       - name: Install dependencies
         working-directory: app_src
@@ -52,19 +64,6 @@ jobs:
         working-directory: app_src
         run: npx expo prebuild --platform android --no-install
 
-      # Pre-flight: run the node commands Gradle shells out to, so an obvious
-      # breakage surfaces with a readable error instead of "exit value 1".
-      - name: Check the node helpers Gradle depends on
-        working-directory: app_src
-        run: |
-          echo "node: $(node --version)"
-          echo "--- expo config ---"
-          npx expo config --json --type public > /dev/null && echo OK
-          echo "--- autolinking resolve ---"
-          npx expo-modules-autolinking resolve -p android --json > /dev/null && echo OK
-          echo "--- react-native config ---"
-          npx expo-modules-autolinking react-native-config --json --platform android > /dev/null && echo OK
-
       - name: Tune the Gradle build
         working-directory: app_src/android
         run: |
@@ -73,8 +72,6 @@ jobs:
           sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g/' gradle.properties
           grep -E "reactNativeArchitectures|jvmargs" gradle.properties
 
-      # --info makes Gradle print the full command line of every process it
-      # spawns, which is the only way to see which `node` call is failing.
       - name: Build the APK
         id: build
         continue-on-error: true
@@ -82,30 +79,24 @@ jobs:
         run: |
           chmod +x ./gradlew
           set -o pipefail
-          ./gradlew assembleRelease --no-daemon --console=plain --info 2>&1 \
+          ./gradlew assembleRelease --no-daemon --console=plain 2>&1 \
             | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Show the real error
         if: steps.build.outcome == 'failure'
         run: |
-          echo "============= NODE COMMANDS GRADLE RAN ============="
-          grep -n "Command: node" build.log | tail -8 || echo "(none found)"
-          echo ""
-          echo "============= CONTEXT AT THE FAILURE =============="
-          LAST=$(grep -n "Command: node" build.log | tail -1 | cut -d: -f1 || true)
-          if [ -n "$LAST" ]; then
-            START=$([ "$LAST" -gt 10 ] && echo $((LAST - 10)) || echo 1)
-            sed -n "${START},$((LAST + 80))p" build.log
-          fi
-          echo ""
-          echo "============= WHAT WENT WRONG ====================="
+          echo "================ WHAT WENT WRONG ================"
           awk '/\* What went wrong:/,/\* Try:/' build.log || true
           echo ""
-          echo "============= LAST 40 USEFUL LINES ================"
+          echo "================ FAILING TASKS =================="
+          grep -nE "^> Task .*FAILED|^FAILURE:|^e: |error:|Execution failed" build.log \
+            | grep -v "org.gradle.internal" | head -30 || true
+          echo ""
+          echo "================ LAST 40 LINES =================="
           grep -v "^	at org.gradle" build.log | tail -40 || true
           exit 1
 
-      - name: Upload the full build log
+      - name: Upload the build log
         if: always()
         run: gzip -9 build.log || true
       - uses: actions/upload-artifact@v4
@@ -142,8 +133,6 @@ jobs:
           name: BunkBank ${{ steps.collect.outputs.stamp }}
           body: |
             Tap **BunkBank.apk** under Assets to install.
-
-            Uninstall BunkBank v1 first - different signing key.
+            Then Settings - Export or import data - Import, and paste your backup.
           files: BunkBank.apk
           fail_on_unmatched_files: false
-
