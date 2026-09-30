@@ -60,6 +60,15 @@ jobs:
         working-directory: app_src
         run: npm install --no-audit --no-fund --legacy-peer-deps
 
+      # expo-splash-screen with a backgroundColor but no image still writes a
+      # reference to @drawable/splashscreen_logo into values.xml without ever
+      # creating that drawable, which fails resource linking. No image is used
+      # here, so the plugin is dropped before the native project is generated.
+      - name: Drop the splash-screen plugin
+        working-directory: app_src
+        run: |
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('app.json','utf8'));const b=(j.expo.plugins||[]).length;j.expo.plugins=(j.expo.plugins||[]).filter(p=>!String(Array.isArray(p)?p[0]:p).includes('splash-screen'));fs.writeFileSync('app.json',JSON.stringify(j,null,2));console.log('plugins '+b+' -> '+j.expo.plugins.length);"
+
       - name: Generate the native Android project
         working-directory: app_src
         run: npx expo prebuild --platform android --no-install
